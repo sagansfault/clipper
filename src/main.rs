@@ -1,4 +1,5 @@
-use std::{time::{Duration, Instant}, thread, fs::File, sync::{mpsc::{Receiver, Sender}, atomic::{AtomicBool, Ordering}, Arc}};
+use std::{time::Duration, thread, fs::File, sync::{mpsc::{Receiver, Sender}, atomic::{AtomicBool, Ordering}, Arc}};
+use egui::ProgressBar;
 use gif::{Encoder, Repeat, Frame};
 use scrap::{Display, Capturer};
 use tokio::runtime::Runtime;
@@ -34,14 +35,13 @@ fn main() {
 struct Clipper {
     async_to_ui: (Sender<State>, Receiver<State>),
     path: String,
-    duration: u8,
     recording: Arc<AtomicBool>,
     current: State,
 }
 
 #[derive(PartialEq, Clone)]
 enum State {
-    Idle, Countdown(u8), Recording, Encoding
+    Idle, Countdown(u8), Recording, Converting(f32), Encoding(f32)
 }
 
 impl Default for Clipper {
@@ -49,7 +49,6 @@ impl Default for Clipper {
         Self {
             async_to_ui: std::sync::mpsc::channel(),
             path: "wow.gif".to_string(),
-            duration: 5,
             recording: Arc::new(AtomicBool::new(false)),
             current: State::Idle,
         }
@@ -73,6 +72,8 @@ impl eframe::App for Clipper {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+
+            ui.add_space(20.0);
 
             egui::Grid::new("my_grid")
                 .num_columns(2)
@@ -99,8 +100,15 @@ impl eframe::App for Clipper {
                     State::Recording => {
                         ui.label("Recording...");
                     },
-                    State::Encoding => {
+                    State::Converting(v) => {
+                        ui.label("Converting (this may take a while)...");
+                        let progress_bar = ProgressBar::new(v).show_percentage().animate(true);
+                        ui.add(progress_bar);
+                    },
+                    State::Encoding(v) => {
                         ui.label("Encoding (this may take a while)...");
+                        let progress_bar = ProgressBar::new(v).show_percentage().animate(true);
+                        ui.add(progress_bar);
                     },
                 }
                 self.current = state;
@@ -126,7 +134,7 @@ impl Clipper {
                 thread::sleep(second);
             }
 
-            let frame_delay = Duration::from_millis(20);
+            let frame_delay = Duration::from_millis(40);
 
             let display = Display::primary().expect("Couldn't find primary display.");
             let mut capturer = Capturer::new(display).expect("Couldn't begin capture.");
@@ -152,24 +160,42 @@ impl Clipper {
                 thread::sleep(frame_delay);
             }
 
+            let _ = send.send(State::Encoding(0.0));
+
+            let frame_count = frame_data.len() as f32;
+            let incr = frame_count / 100.0 / 100.0;
+            let mut current = 0.0;
+
             let mut rgba_frame_data: Vec<Vec<u8>> = Vec::with_capacity(frame_data.len());
             for frame in frame_data {
                 let mut new_frame: Vec<u8> = Vec::with_capacity(frame.len());
-                for byte in frame.chunks(4) {
-                    new_frame.push(byte[2]); // R
-                    new_frame.push(byte[1]); // G
-                    new_frame.push(byte[0]); // B
-                    new_frame.push(byte[3]); // A
+                let rows = frame.chunks(w * 4);
+                for (i, row) in rows.into_iter().enumerate() {
+                    if i % 2 == 0 {
+                        continue;
+                    }
+                    let mut row = row.chunks(4).into_iter().enumerate()
+                        .filter(|(byte_ind, _)| byte_ind % 2 == 0)
+                        .map(|(_, byte)| {
+                            vec![byte[2], byte[1], byte[0], byte[3]] // flip BGRA to RGBA
+                        })
+                        .flatten()
+                        .collect::<Vec<u8>>();
+                    new_frame.append(&mut row);
                 }
                 rgba_frame_data.push(new_frame);
+
+                current += incr;
+                let _ = send.send(State::Converting(current));
             }
 
-            let width = w as u16;
-            let height = h as u16;
+            current = 0.0;
+            let _ = send.send(State::Encoding(current));
+
+            let width = (w / 2) as u16;
+            let height = (h / 2) as u16;
             
             let frame_data = rgba_frame_data;
-
-            let _ = send.send(State::Encoding);
 
             let color_map = &[0xFF, 0xFF, 0xFF, 0, 0, 0];
             let mut image = File::create(path.as_str()).expect("Could not create file");
@@ -177,9 +203,12 @@ impl Clipper {
             encoder.set_repeat(Repeat::Infinite).expect("Could not set encoder property");
             for mut frame_data_single in frame_data {
                 let mut frame = Frame::from_rgba_speed(width, height, &mut frame_data_single, 30);
-                frame.delay = 5;
+                frame.delay = 7;
                 frame.make_lzw_pre_encoded();
                 encoder.write_lzw_pre_encoded_frame(&frame).expect("Could not write frame to encoder");
+
+                current += incr;
+                let _ = send.send(State::Encoding(current));
             }
 
             let _ = send.send(State::Idle);
