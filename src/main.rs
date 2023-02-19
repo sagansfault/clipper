@@ -1,5 +1,4 @@
-use std::{time::{Duration, Instant}, thread, fs::File, sync::mpsc::{Receiver, Sender}};
-
+use std::{time::{Duration, Instant}, thread, fs::File, sync::{mpsc::{Receiver, Sender}, atomic::{AtomicBool, Ordering}, Arc}};
 use gif::{Encoder, Repeat, Frame};
 use scrap::{Display, Capturer};
 use tokio::runtime::Runtime;
@@ -33,10 +32,10 @@ fn main() {
 }
 
 struct Clipper {
-    send: Sender<State>,
-    recv: Receiver<State>,
+    async_to_ui: (Sender<State>, Receiver<State>),
     path: String,
     duration: u8,
+    recording: Arc<AtomicBool>,
     current: State,
 }
 
@@ -47,12 +46,11 @@ enum State {
 
 impl Default for Clipper {
     fn default() -> Self {
-        let (send, recv) = std::sync::mpsc::channel();
-        Self { 
-            send,
-            recv,
+        Self {
+            async_to_ui: std::sync::mpsc::channel(),
             path: "wow.gif".to_string(),
             duration: 5,
+            recording: Arc::new(AtomicBool::new(false)),
             current: State::Idle,
         }
     }
@@ -60,6 +58,20 @@ impl Default for Clipper {
 
 impl eframe::App for Clipper {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+
+        if ctx.input().key_pressed(egui::Key::Q) && ctx.input().modifiers.alt {
+            match self.current {
+                State::Idle => {
+                    self.recording.store(true, Ordering::SeqCst);
+                    self.run();
+                },
+                State::Recording => {
+                    self.recording.store(false, Ordering::SeqCst);
+                },
+                _ => {}
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
 
             egui::Grid::new("my_grid")
@@ -71,22 +83,15 @@ impl eframe::App for Clipper {
                     ui.label("File/path:");
                     ui.add(egui::TextEdit::singleline(&mut self.path).hint_text("File name/path"));
                     ui.end_row();
-
-                    ui.label("Duration:");
-                    ui.add(egui::DragValue::new(&mut self.duration).clamp_range(3..=20));
-                    ui.end_row();
             });
             ui.vertical_centered(|ui| {
                 ui.add_space(10.0);
 
-                let state = self.recv.try_recv().unwrap_or(self.current.clone());
+                let state = self.async_to_ui.1.try_recv().unwrap_or(self.current.clone());
                 
                 match state {
                     State::Idle => {
-                        if ui.button("Clip").clicked() {
-                            assert!(self.path.ends_with(".gif"), "Path must end with .gif");
-                            self.run();
-                        }
+                        ui.label("Press Alt+Q to start/stop recording");
                     },
                     State::Countdown(v) => {
                         ui.label(format!("Recording in {}...", v));
@@ -107,9 +112,10 @@ impl eframe::App for Clipper {
 impl Clipper {
 
     fn run(&mut self) {
-        let duration = self.duration.clone();
         let path = self.path.clone();
-        let send = self.send.clone();
+        let send = self.async_to_ui.0.clone();
+
+        let recording = Arc::clone(&self.recording);
 
         tokio::spawn(async move {
             let second = Duration::from_secs(1);
@@ -128,10 +134,8 @@ impl Clipper {
 
             let _ = send.send(State::Recording);
 
-            let duration = Duration::from_secs(duration as u64);
-            let elapsed = Instant::now();
             let mut frame_data: Vec<Vec<u8>> = vec![];
-            while elapsed.elapsed() <= duration {
+            while recording.load(Ordering::SeqCst) {
                 let frame = match capturer.frame() {
                     Ok(f) => f,
                     Err(error) => {
@@ -159,11 +163,11 @@ impl Clipper {
                 }
                 rgba_frame_data.push(new_frame);
             }
-            
-            let frame_data = rgba_frame_data;
 
             let width = w as u16;
             let height = h as u16;
+            
+            let frame_data = rgba_frame_data;
 
             let _ = send.send(State::Encoding);
 
@@ -175,7 +179,6 @@ impl Clipper {
                 let mut frame = Frame::from_rgba_speed(width, height, &mut frame_data_single, 30);
                 frame.delay = 5;
                 frame.make_lzw_pre_encoded();
-                //encoder.write_frame(&frame)?;
                 encoder.write_lzw_pre_encoded_frame(&frame).expect("Could not write frame to encoder");
             }
 
