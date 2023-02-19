@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
+
 use std::{time::Duration, thread, fs::File, sync::{mpsc::{Receiver, Sender}, atomic::{AtomicBool, Ordering}, Arc}};
 use egui::ProgressBar;
 use gif::{Encoder, Repeat, Frame};
