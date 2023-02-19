@@ -2,9 +2,9 @@
 A simple screen gif recording program
 
 Record a clip of your screen immediately to a gif   
-Just set the recording time and the file name/path
+Set the file/path to save the gif to (in relation to the .exe) and press **Alt+Q** to start/stop recording
 
-![image](https://user-images.githubusercontent.com/21296154/219890686-579b20b2-37aa-4ba8-a2de-21b5ce9fa42b.png)
+![image](https://user-images.githubusercontent.com/21296154/219916409-3a6fe550-68a1-493d-ae91-401e93a41e14.png)
 ---
 
-Download the program from the Releases section and run the exe.
+Download the latest version of the program exe from the [releases](https://github.com/sagansfault/clipper/releases) section and run it.
