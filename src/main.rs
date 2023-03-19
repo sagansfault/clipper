@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
-use std::{time::Duration, thread, fs::File, sync::{mpsc::{Receiver, Sender}, atomic::{AtomicBool, Ordering}, Arc}};
+use std::{time::Duration, thread, fs::File, sync::{mpsc::{Receiver, Sender}, atomic::{AtomicBool, Ordering}, Arc}, collections::VecDeque};
 use egui::ProgressBar;
 use gif::{Encoder, Repeat, Frame};
 use scrap::{Display, Capturer};
@@ -25,6 +25,7 @@ fn main() {
 
     let options = eframe::NativeOptions {
         initial_window_size: Some(egui::vec2(300.0, 200.0)),
+        icon_data: Some(load_icon(".\\icon.png")),
         ..Default::default()
     };
     eframe::run_native(
@@ -34,10 +35,28 @@ fn main() {
     );
 }
 
+fn load_icon(path: &str) -> eframe::IconData {
+    let (icon_rgba, icon_width, icon_height) = {
+        let image = image::open(path)
+            .expect("Failed to open icon path")
+            .into_rgba8();
+        let (width, height) = image.dimensions();
+        let rgba = image.into_raw();
+        (rgba, width, height)
+    };
+
+    eframe::IconData {
+        rgba: icon_rgba,
+        width: icon_width,
+        height: icon_height,
+    }
+}
+
 struct Clipper {
     async_to_ui: (Sender<State>, Receiver<State>),
     path: String,
     recording: Arc<AtomicBool>,
+    buffer_length_seconds: usize,
     current: State,
 }
 
@@ -52,6 +71,7 @@ impl Default for Clipper {
             async_to_ui: std::sync::mpsc::channel(),
             path: "wow.gif".to_string(),
             recording: Arc::new(AtomicBool::new(false)),
+            buffer_length_seconds: 5,
             current: State::Idle,
         }
     }
@@ -59,19 +79,6 @@ impl Default for Clipper {
 
 impl eframe::App for Clipper {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-
-        if ctx.input().key_pressed(egui::Key::Q) && ctx.input().modifiers.alt {
-            match self.current {
-                State::Idle => {
-                    self.recording.store(true, Ordering::SeqCst);
-                    self.run();
-                },
-                State::Recording => {
-                    self.recording.store(false, Ordering::SeqCst);
-                },
-                _ => {}
-            }
-        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
 
@@ -82,10 +89,11 @@ impl eframe::App for Clipper {
                 .spacing([40.0, 20.0])
                 .striped(true)
                 .show(ui, |ui| {
-
                     ui.label("File/path:");
                     ui.add(egui::TextEdit::singleline(&mut self.path).hint_text("File name/path"));
                     ui.end_row();
+                    ui.label("Buffer (seconds):");
+                    ui.add(egui::DragValue::new(&mut self.buffer_length_seconds).speed(1.0))
             });
             ui.vertical_centered(|ui| {
                 ui.add_space(10.0);
@@ -94,13 +102,19 @@ impl eframe::App for Clipper {
                 
                 match state {
                     State::Idle => {
-                        ui.label("Press Alt+Q to start/stop recording");
+                        if ui.button("Start").clicked() {
+                            self.recording.store(true, Ordering::SeqCst);
+                            self.run();
+                        }
                     },
                     State::Countdown(v) => {
                         ui.label(format!("Recording in {}...", v));
                     },
                     State::Recording => {
                         ui.label("Recording...");
+                        if ui.button("Stop").clicked() {
+                            self.recording.store(false, Ordering::SeqCst);
+                        }
                     },
                     State::Converting(v) => {
                         ui.label("Converting (this may take a while)...");
@@ -123,6 +137,7 @@ impl Clipper {
 
     fn run(&mut self) {
         let path = self.path.clone();
+        let buffer_length_seconds = self.buffer_length_seconds.clone();
         let send = self.async_to_ui.0.clone();
 
         let recording = Arc::clone(&self.recording);
@@ -144,7 +159,7 @@ impl Clipper {
 
             let _ = send.send(State::Recording);
 
-            let mut frame_data: Vec<Vec<u8>> = vec![];
+            let mut frame_data: VecDeque<Vec<u8>> = VecDeque::new();
             while recording.load(Ordering::SeqCst) {
                 let frame = match capturer.frame() {
                     Ok(f) => f,
@@ -158,7 +173,10 @@ impl Clipper {
                     }
                 };
                 let data = frame.to_vec();
-                frame_data.push(data);
+                frame_data.push_back(data);
+                if frame_data.len() > buffer_length_seconds * 13 /* about 13 frames per second */ {
+                    frame_data.pop_front();
+                }
                 thread::sleep(frame_delay);
             }
 
