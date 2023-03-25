@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
-use std::{time::Duration, thread, fs::File, sync::{mpsc::{Receiver, Sender}, atomic::{AtomicBool, Ordering}, Arc}, collections::VecDeque};
+use std::{time::{Duration, Instant}, thread, fs::File, sync::{mpsc::{Receiver, Sender}, atomic::{AtomicBool, Ordering}, Arc}, collections::VecDeque};
 use egui::ProgressBar;
 use gif::{Encoder, Repeat, Frame};
 use scrap::{Display, Capturer};
@@ -24,7 +24,7 @@ fn main() {
     });
 
     let options = eframe::NativeOptions {
-        initial_window_size: Some(egui::vec2(300.0, 200.0)),
+        initial_window_size: Some(egui::vec2(300.0, 230.0)),
         icon_data: Some(load_icon(".\\icon.png")),
         ..Default::default()
     };
@@ -56,13 +56,104 @@ struct Clipper {
     async_to_ui: (Sender<State>, Receiver<State>),
     path: String,
     recording: Arc<AtomicBool>,
-    buffer_length_seconds: usize,
+    clip_length: usize,
+    fps: u8,
     current: State,
+    quality: Quality,
 }
 
 #[derive(PartialEq, Clone)]
 enum State {
-    Idle, Countdown(u8), Recording, Converting(f32), Encoding(f32)
+    Idle, Recording, Converting(f32), Encoding(f32)
+}
+
+#[derive(PartialEq, Clone, Debug)]
+enum Quality {
+    Original, Half
+}
+
+trait Encode {
+    fn encode(&self, frames: Vec<Vec<u8>>, target: File, original_width: usize, original_height: usize, send: Sender<State>, fps: u8);
+}
+
+impl Encode for Quality {
+    fn encode(&self, frames: Vec<Vec<u8>>, target: File, original_width: usize, original_height: usize, send: Sender<State>, fps: u8) {
+        match self {
+            Quality::Original => {
+                let frame_count = frames.len() as f32;
+                let incr = frame_count / 100.0 / 100.0;
+                let mut current = 0.0;
+                let _ = send.send(State::Encoding(current));
+
+                let width = original_width as u16;
+                let height = original_height as u16;
+
+                let color_map = &[0xFF, 0xFF, 0xFF, 0, 0, 0];
+                let mut image = target;
+                let mut encoder = Encoder::new(&mut image, width, height, color_map).expect("Could not create encoder");
+                encoder.set_repeat(Repeat::Infinite).expect("Could not set encoder property");
+                for mut frame_data_single in frames {
+                    let mut frame = Frame::from_rgba_speed(width, height, &mut frame_data_single, 30);
+                    frame.delay = (100.0 / fps as f64) as u16;
+                
+                    frame.make_lzw_pre_encoded();
+                    encoder.write_lzw_pre_encoded_frame(&frame).expect("Could not write frame to encoder");
+
+                    current += incr;
+                    let _ = send.send(State::Encoding(current));
+                }
+            },
+            Quality::Half => {
+                let frame_count = frames.len() as f32;
+                let incr = frame_count / 100.0 / 100.0;
+                let mut current = 0.0;
+
+                let mut frame_data = vec![];
+                for frame in frames {
+                    let mut new_frame: Vec<u8> = Vec::with_capacity(frame.len());
+                    let rows = frame.chunks(original_width * 4);
+                    for (i, row) in rows.into_iter().enumerate() {
+                        if i % 2 == 0 {
+                            continue;
+                        }
+                        let mut row = row.chunks(4).into_iter().enumerate()
+                            .filter(|(byte_ind, _)| byte_ind % 2 == 0)
+                            .map(|(_, val)| {
+                                val.to_vec()
+                            })
+                            .flatten()
+                            .collect::<Vec<u8>>();
+                        new_frame.append(&mut row);
+                    }
+                    frame_data.push(new_frame);
+    
+                    current += incr;
+                    let _ = send.send(State::Converting(current));
+                }
+
+                current = 0.0;
+                let _ = send.send(State::Encoding(current));
+
+                let width = (original_width / 2) as u16;
+                let height = (original_height / 2) as u16;
+
+                let color_map = &[0xFF, 0xFF, 0xFF, 0, 0, 0];
+                let mut image = target;
+                let mut encoder = Encoder::new(&mut image, width, height, color_map).expect("Could not create encoder");
+                encoder.set_repeat(Repeat::Infinite).expect("Could not set encoder property");
+                for mut frame_data_single in frame_data {
+                    let mut frame = Frame::from_rgba_speed(width, height, &mut frame_data_single, 30);
+                    frame.delay = (100.0 / fps as f64) as u16;
+                
+                    frame.make_lzw_pre_encoded();
+                    encoder.write_lzw_pre_encoded_frame(&frame).expect("Could not write frame to encoder");
+
+                    current += incr;
+                    let _ = send.send(State::Encoding(current));
+                }
+            },
+        }
+    }
 }
 
 impl Default for Clipper {
@@ -71,8 +162,10 @@ impl Default for Clipper {
             async_to_ui: std::sync::mpsc::channel(),
             path: "wow.gif".to_string(),
             recording: Arc::new(AtomicBool::new(false)),
-            buffer_length_seconds: 5,
+            clip_length: 5,
+            fps: 30,
             current: State::Idle,
+            quality: Quality::Half,
         }
     }
 }
@@ -92,8 +185,25 @@ impl eframe::App for Clipper {
                     ui.label("File/path:");
                     ui.add(egui::TextEdit::singleline(&mut self.path).hint_text("File name/path"));
                     ui.end_row();
-                    ui.label("Buffer (seconds):");
-                    ui.add(egui::DragValue::new(&mut self.buffer_length_seconds).speed(1.0))
+                    ui.label("Clip Length (seconds):");
+                    ui.add(egui::DragValue::new(&mut self.clip_length).speed(1.0));
+                    ui.end_row();
+                    ui.label("FPS:");
+                    egui::ComboBox::from_id_source("fps").selected_text(format!("{}", self.fps))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.fps, 10, "10");
+                            ui.selectable_value(&mut self.fps, 20, "20");
+                            ui.selectable_value(&mut self.fps, 25, "25");
+                            ui.selectable_value(&mut self.fps, 33, "33");
+                            ui.selectable_value(&mut self.fps, 50, "50");
+                        });
+                    ui.end_row();
+                    ui.label("Quality:");
+                    egui::ComboBox::from_id_source("quality").selected_text(format!("{:?}", self.quality))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.quality, Quality::Half, "Half");
+                            ui.selectable_value(&mut self.quality, Quality::Original, "Original")
+                        });
             });
             ui.vertical_centered(|ui| {
                 ui.add_space(10.0);
@@ -107,9 +217,6 @@ impl eframe::App for Clipper {
                             self.run();
                         }
                     },
-                    State::Countdown(v) => {
-                        ui.label(format!("Recording in {}...", v));
-                    },
                     State::Recording => {
                         ui.label("Recording...");
                         if ui.button("Stop").clicked() {
@@ -118,12 +225,14 @@ impl eframe::App for Clipper {
                     },
                     State::Converting(v) => {
                         ui.label("Converting (this may take a while)...");
-                        let progress_bar = ProgressBar::new(v).show_percentage().animate(true);
+                        let proper = ((v * 100.0) as u32) as f32 / 100.0;
+                        let progress_bar = ProgressBar::new(proper).show_percentage().animate(true);
                         ui.add(progress_bar);
                     },
                     State::Encoding(v) => {
                         ui.label("Encoding (this may take a while)...");
-                        let progress_bar = ProgressBar::new(v).show_percentage().animate(true);
+                        let proper = ((v * 100.0) as u32) as f32 / 100.0;
+                        let progress_bar = ProgressBar::new(proper).show_percentage().animate(true);
                         ui.add(progress_bar);
                     },
                 }
@@ -137,21 +246,16 @@ impl Clipper {
 
     fn run(&mut self) {
         let path = self.path.clone();
-        let buffer_length_seconds = self.buffer_length_seconds.clone();
+        let clip_length = self.clip_length.clone();
+        let fps = self.fps.clone();
         let send = self.async_to_ui.0.clone();
+        let quality = self.quality.clone();
 
         let recording = Arc::clone(&self.recording);
 
         tokio::spawn(async move {
-            let second = Duration::from_secs(1);
-            let one_sixthyth = second / 60;
-
-            for i in 0..3 {
-                let _ = send.send(State::Countdown(3 - i));
-                thread::sleep(second);
-            }
-
-            let frame_delay = Duration::from_millis(40);
+            let ms_per_frame = Duration::from_millis((1000.0 / fps as f64) as u64);
+            let one_sixthyth = Duration::from_secs(1) / 60;
 
             let display = Display::primary().expect("Couldn't find primary display.");
             let mut capturer = Capturer::new(display).expect("Couldn't begin capture.");
@@ -160,7 +264,11 @@ impl Clipper {
             let _ = send.send(State::Recording);
 
             let mut frame_data: VecDeque<Vec<u8>> = VecDeque::new();
-            while recording.load(Ordering::SeqCst) {
+            let mut instant = Instant::now();
+            loop {
+                if !recording.load(Ordering::SeqCst) {
+                    break;
+                }
                 let frame = match capturer.frame() {
                     Ok(f) => f,
                     Err(error) => {
@@ -174,62 +282,29 @@ impl Clipper {
                 };
                 let data = frame.to_vec();
                 frame_data.push_back(data);
-                if frame_data.len() > buffer_length_seconds * 13 /* about 13 frames per second */ {
+                if frame_data.len() > clip_length * fps as usize {
                     frame_data.pop_front();
                 }
-                thread::sleep(frame_delay);
+                let elapsed = instant.elapsed();
+                if ms_per_frame > elapsed {
+                    spin_sleep::sleep(ms_per_frame - elapsed);
+                };
+                instant = Instant::now();
             }
 
-            let _ = send.send(State::Encoding(0.0));
-
-            let frame_count = frame_data.len() as f32;
-            let incr = frame_count / 100.0 / 100.0;
             let mut current = 0.0;
-
-            let mut rgba_frame_data: Vec<Vec<u8>> = Vec::with_capacity(frame_data.len());
-            for frame in frame_data {
-                let mut new_frame: Vec<u8> = Vec::with_capacity(frame.len());
-                let rows = frame.chunks(w * 4);
-                for (i, row) in rows.into_iter().enumerate() {
-                    if i % 2 == 0 {
-                        continue;
-                    }
-                    let mut row = row.chunks(4).into_iter().enumerate()
-                        .filter(|(byte_ind, _)| byte_ind % 2 == 0)
-                        .map(|(_, byte)| {
-                            vec![byte[2], byte[1], byte[0], byte[3]] // flip BGRA to RGBA
-                        })
-                        .flatten()
-                        .collect::<Vec<u8>>();
-                    new_frame.append(&mut row);
-                }
-                rgba_frame_data.push(new_frame);
-
+            let incr = frame_data.len() as f32 / 100.0 / 100.0;
+            // flip BGRA to RGBA
+            let frame_data = frame_data.iter().map(|frame| {
                 current += incr;
                 let _ = send.send(State::Converting(current));
-            }
+                frame.chunks(4).into_iter().map(|byte| {
+                    vec![byte[2], byte[1], byte[0], byte[3]]
+                }).flatten().collect::<Vec<u8>>()
+            }).collect::<Vec<Vec<u8>>>();
 
-            current = 0.0;
-            let _ = send.send(State::Encoding(current));
-
-            let width = (w / 2) as u16;
-            let height = (h / 2) as u16;
-            
-            let frame_data = rgba_frame_data;
-
-            let color_map = &[0xFF, 0xFF, 0xFF, 0, 0, 0];
-            let mut image = File::create(path.as_str()).expect("Could not create file");
-            let mut encoder = Encoder::new(&mut image, width, height, color_map).expect("Could not create encoder");
-            encoder.set_repeat(Repeat::Infinite).expect("Could not set encoder property");
-            for mut frame_data_single in frame_data {
-                let mut frame = Frame::from_rgba_speed(width, height, &mut frame_data_single, 30);
-                frame.delay = 7;
-                frame.make_lzw_pre_encoded();
-                encoder.write_lzw_pre_encoded_frame(&frame).expect("Could not write frame to encoder");
-
-                current += incr;
-                let _ = send.send(State::Encoding(current));
-            }
+            let file = File::create(path.as_str()).expect("Could not create file");
+            quality.encode(frame_data, file, w, h, send.clone(), fps);
 
             let _ = send.send(State::Idle);
         });
