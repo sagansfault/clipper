@@ -184,10 +184,10 @@ fn encode(buf: VecDeque<Vec<u8>>, width: usize, height: usize, fps: u8) {
 
 fn create_file() -> (File, String) {
     let mut v = OpenOptions::new().create_new(true).write(true).open("clip.gif");
-    let mut i = 1;
+    let mut i = 0;
     while v.is_err() {
-        v = OpenOptions::new().create_new(true).write(true).open(format!("clip({}).gif", i));
         i += 1;
+        v = OpenOptions::new().create_new(true).write(true).open(format!("clip({}).gif", i));
     }
     (v.unwrap(), if i == 0 { "clip.gif".to_string() } else { format!("clip({}).gif", i) })
 }
