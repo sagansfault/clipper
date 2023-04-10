@@ -162,7 +162,8 @@ fn encode(buf: VecDeque<Vec<u8>>, width: usize, height: usize, fps: u8) {
 
     let color_map = &[0xFF, 0xFF, 0xFF, 0, 0, 0];
 
-    let mut image = create_file();
+    let (mut image, name) = create_file();
+    println!("Saving as: {}...", name);
 
     let mut encoder = Encoder::new(&mut image, half_width, half_height, color_map)
         .expect("Could not create encoder");
@@ -178,14 +179,15 @@ fn encode(buf: VecDeque<Vec<u8>>, width: usize, height: usize, fps: u8) {
             .write_lzw_pre_encoded_frame(&frame)
             .expect("Could not write frame to encoder");
     }
+
 }
 
-fn create_file() -> File {
+fn create_file() -> (File, String) {
     let mut v = OpenOptions::new().create_new(true).open("clip");
     let mut i = 1;
     while v.is_err() {
         v = OpenOptions::new().create_new(true).open(format!("clip({})", i));
         i += 1;
     }
-    v.unwrap()
+    (v.unwrap(), format!("clip({})", i))
 }
