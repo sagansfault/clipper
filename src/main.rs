@@ -4,7 +4,7 @@ use gif::{Encoder, Frame, Repeat};
 use scrap::{Capturer, Display};
 use std::{
     collections::VecDeque,
-    fs::File,
+    fs::{File, OpenOptions},
     thread,
     time::{Duration, Instant},
 };
@@ -32,7 +32,6 @@ fn main() {
     });
 
     let mut state: State = State::Idle;
-    let path = "wow.gif".to_string();
     let clip_length = 5;
     let fps = 30;
 
@@ -72,7 +71,7 @@ fn main() {
                     let _ = state_signal.0.send(state.clone());
                     let cloned = buf.clone();
                     buf.clear(); // clear right after cloning to have the state be as clean as possible
-                    encode(cloned, path.clone(), width, height, fps);
+                    encode(cloned, width, height, fps);
                     println!("Done!");
                     state = State::Idle;
                 }
@@ -123,7 +122,7 @@ async fn run(fps: u8, signal_receiver: Receiver<State>, data_sender: Sender<Vec<
     }
 }
 
-fn encode(buf: VecDeque<Vec<u8>>, path: String, width: usize, height: usize, fps: u8) {
+fn encode(buf: VecDeque<Vec<u8>>, width: usize, height: usize, fps: u8) {
     // flip BGRA to RGBA
     let buf = buf
         .iter()
@@ -162,7 +161,9 @@ fn encode(buf: VecDeque<Vec<u8>>, path: String, width: usize, height: usize, fps
     let half_height = (height / 2) as u16;
 
     let color_map = &[0xFF, 0xFF, 0xFF, 0, 0, 0];
-    let mut image = File::create(path.as_str()).expect("Could not create file");
+
+    let mut image = create_file();
+
     let mut encoder = Encoder::new(&mut image, half_width, half_height, color_map)
         .expect("Could not create encoder");
     encoder
@@ -177,4 +178,14 @@ fn encode(buf: VecDeque<Vec<u8>>, path: String, width: usize, height: usize, fps
             .write_lzw_pre_encoded_frame(&frame)
             .expect("Could not write frame to encoder");
     }
+}
+
+fn create_file() -> File {
+    let mut v = OpenOptions::new().create_new(true).open("clip");
+    let mut i = 1;
+    while v.is_err() {
+        v = OpenOptions::new().create_new(true).open(format!("clip({})", i));
+        i += 1;
+    }
+    v.unwrap()
 }
