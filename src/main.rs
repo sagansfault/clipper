@@ -1,6 +1,7 @@
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use device_query::{DeviceQuery, DeviceState, Keycode};
 use gif::{Encoder, Frame, Repeat};
+use indicatif::{ProgressStyle, ProgressBar, MultiProgress};
 use scrap::{Capturer, Display};
 use std::{
     collections::VecDeque,
@@ -42,7 +43,7 @@ fn main() {
     let (width, height) = (display.width(), display.height());
 
     let mut buf: VecDeque<Vec<u8>> = VecDeque::new();
-    println!("Press \"Alt+A\" to start/clip recording");
+    println!("Press \"Alt+Q\" to start/clip recording");
 
     let mut previous: Vec<Keycode> = vec![];
     loop {
@@ -66,13 +67,11 @@ fn main() {
                     println!("Recording...");
                 }
                 State::Recording => {
-                    println!("Encoding...");
                     state = State::Encoding(0);
                     let _ = state_signal.0.send(state.clone());
                     let cloned = buf.clone();
                     buf.clear(); // clear right after cloning to have the state be as clean as possible
                     encode(cloned, width, height, fps);
-                    println!("Done!");
                     state = State::Idle;
                 }
                 State::Encoding(_) => {}
@@ -83,7 +82,7 @@ fn main() {
 }
 
 fn check_keys(keys: &Vec<Keycode>) -> bool {
-    keys.contains(&Keycode::LAlt) && keys.contains(&Keycode::A)
+    keys.contains(&Keycode::LAlt) && keys.contains(&Keycode::Q)
 }
 
 async fn run(fps: u8, signal_receiver: Receiver<State>, data_sender: Sender<Vec<u8>>) {
@@ -124,17 +123,17 @@ async fn run(fps: u8, signal_receiver: Receiver<State>, data_sender: Sender<Vec<
 
 fn encode(buf: VecDeque<Vec<u8>>, width: usize, height: usize, fps: u8) {
     // flip BGRA to RGBA
-    let buf = buf
-        .iter()
-        .map(|frame| {
-            frame
-                .chunks(4)
-                .into_iter()
-                .map(|byte| vec![byte[2], byte[1], byte[0], byte[3]])
-                .flatten()
-                .collect::<Vec<u8>>()
-        })
-        .collect::<Vec<Vec<u8>>>();
+    let count = buf.len() as u64;
+    
+    let m = MultiProgress::new();
+    let sty = ProgressStyle::with_template(
+        "[{elapsed_precise}] {bar} {pos:>7}/{len:7} {msg}",
+    )
+    .unwrap()
+    .progress_chars("##-");
+
+    let pb = m.add(ProgressBar::new(count));
+    pb.set_style(sty.clone());
 
     let mut frame_data = vec![];
     for frame in buf {
@@ -155,7 +154,32 @@ fn encode(buf: VecDeque<Vec<u8>>, width: usize, height: usize, fps: u8) {
             new_frame.append(&mut row);
         }
         frame_data.push(new_frame);
+
+        pb.set_message("scaling");
+        pb.inc(1);
     }
+    pb.finish_with_message("Done");
+
+    let pb2 = m.insert_after(&pb, ProgressBar::new(count));
+    pb2.set_style(sty.clone());
+
+    let frame_data = frame_data
+        .iter()
+        .map(|frame| {
+            pb2.inc(1);
+            pb2.set_message("converting");
+            frame
+                .chunks(4)
+                .into_iter()
+                .map(|byte| vec![byte[2], byte[1], byte[0], byte[3]])
+                .flatten()
+                .collect::<Vec<u8>>()
+        })
+        .collect::<Vec<Vec<u8>>>();
+    pb2.finish_with_message("Done");
+
+    let pb3 = m.insert_after(&pb2, ProgressBar::new(count));
+    pb3.set_style(sty);
 
     let half_width = (width / 2) as u16;
     let half_height = (height / 2) as u16;
@@ -163,7 +187,6 @@ fn encode(buf: VecDeque<Vec<u8>>, width: usize, height: usize, fps: u8) {
     let color_map = &[0xFF, 0xFF, 0xFF, 0, 0, 0];
 
     let (mut image, name) = create_file();
-    println!("Saving as: {}...", name);
 
     let mut encoder = Encoder::new(&mut image, half_width, half_height, color_map)
         .expect("Could not create encoder");
@@ -178,8 +201,14 @@ fn encode(buf: VecDeque<Vec<u8>>, width: usize, height: usize, fps: u8) {
         encoder
             .write_lzw_pre_encoded_frame(&frame)
             .expect("Could not write frame to encoder");
-    }
 
+        pb3.set_message("encoding");
+        pb3.inc(1);
+    }
+    pb3.finish_with_message("Done");
+
+    println!("Saved as: {}", name);
+    println!("Press \"Alt+Q\" to start recording again");
 }
 
 fn create_file() -> (File, String) {
